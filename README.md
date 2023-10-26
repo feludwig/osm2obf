@@ -20,7 +20,7 @@ systems and processing is usually done one-by-one to not put too much pressure o
 
 ## PostgreSQL+PostGIS OpenStreetMap database
 
-* [https://github.com/feludwig/pgsql2osm](pgsql2osm)
+* [pgsql2osm](https://github.com/feludwig/pgsql2osm)
 * database `SELECT` permissions
 
 * still need to translate mkobf.sh to python
