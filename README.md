@@ -7,13 +7,14 @@ The main goal is to produce a `.obf` file without crashing. This can be a challe
 systems and processing is usually done one-by-one to not put too much pressure on RAM
 (instead of opting for performance by running everything in parallel).
 
-** Experimental **
+**Experimental**
 
 # Requirements
 
 ## `osm` input file
 
-** Unsupported ** : reading in osm directly, for now only extracts from database.
+
+**Unsupported** : reading in osm directly, for now only extracts from database.
 
 * `osmium`
 
