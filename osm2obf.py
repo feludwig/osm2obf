@@ -198,30 +198,32 @@ def osmium_get_extent(filename:str)->(float,float,float,float) :
     return accum_bbox
 
 def run_java_mapcreator(*args:str,**kwargs)->datetime.timedelta :
+    verbose=True
+
     start_t=datetime.datetime.now()
     env=[]
     for k,v in kwargs.items() :
         env.append(f'{k}={v}')
     if len(env)!=0 :
         env.insert(0,'env')
-    try :
-        a=subprocess.Popen(
-            [*env,'bash','run_mapcreator.sh',*args],
-            stdout=subprocess.PIPE,stderr=subprocess.PIPE
-        )
-        a.wait()
-    except subprocess.CalledProcessError as err:
-        print(a.stdout.read())
-        print(a.stderr.read())
-        raise err
+    cmd=[*env,'bash','/home/user/src/run_mapcreator.sh',*args]
+    a=subprocess.Popen(cmd,stdout=sys.stdout if verbose else subprocess.PIPE,
+            stderr=sys.stderr if verbose else subprocess.PIPE)
+    a.wait(timeout=24*3600) #wait at most 24h, crash else
+    if verbose :
+        print('\n'*5)
+    if a.returncode!=0 :
+        print(a.stdout.read().decode())
+        print(a.stderr.read().decode())
+        exit(a.returncode)
     return datetime.datetime.now()-start_t
 
 
 def assemble_splits_to_obf(input_splits:typing.Iterator[str],output_prefix:str) :
     input_splits=list(input_splits) #in case of a generator, collapse it (for reading multiple times)
     max_ram='10G'
-    max_ram_int=round(sum(map(os.path.getsize,input_splits))*10/len(input_splits)*1e-9)
-    max_ram=str(min(max_ram_int,1))+'G' #?
+    max_ram_int=round(max(map(os.path.getsize,input_splits))*10*1e-9)
+    max_ram=str(max(max_ram_int,1))+'G' #?
     print('max_ram',max_ram)
     work_dir='/'.join(output_prefix.split('/')[:-1])
     obf_splits=[]
@@ -254,17 +256,21 @@ Usage:
 if __name__=='__main__' :
     dbaccess,osm_rel_id,output_prefix=sys.argv[1:]
 
-    if True : #TEMP
+    mode=3 #TEMP, 1:osmium, 2:pgsql2osm, 3:debug, from already existing splits
+    if mode==1 :
         filename=osm_rel_id
         out_splits_osm=list(multi_osm_to_obf_osmium(
             statically_get_splits(osmium_get_extent(filename)),filename,output_prefix
         ))
-    else :
+    elif mode==2 :
         osm_rel_id=int(osm_rel_id)
         a=psycopg2.connect(dbaccess)
         stripes=get_stripes_by_area(calculate_areas(a.cursor()))
         out_splits_osm=list(multi_osm_to_obf_pgsql2osm(a,stripes,output_prefix,osm_rel_id))
+    elif mode==3 :
+        import glob
+        out_splits_osm=list(sorted(glob.glob(output_prefix+'*.osm.bz2')))
 
     assemble_splits_to_obf(out_splits_osm,output_prefix)
 
-    [os.remove(i) for i in out_splits_osm]
+    #[os.remove(i) for i in out_splits_osm]
