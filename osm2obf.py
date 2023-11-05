@@ -99,14 +99,14 @@ def multi_osm_to_obf_osmium(bboxes:typing.Iterator[bbox_t],input_file:str,output
 def multi_osm_to_obf_pgsql2osm(access:psycopg2.extensions.connection,stripes:typing.Iterator[bbox_t],
         output_prefix:str,osm_rel_id:int)->typing.Iterator[str] :
 
+    stripes=list(stripes) #collapse generator
+    print('getting',len(stripes),'stripes')
+
     m=pgsql2osm.ModuleSettings(
         bounds_rel_id=osm_rel_id,
         get_lonlat_binary='/home/user/src/osm2pgsql/build/get_lonlat',
         nodes_file='/mnt/dbp/maps/planet.bin.nodes',
         access=access)
-
-    stripes=list(stripes) #collapse generator
-    print('getting',len(stripes),'stripes')
     for bbox in stripes :
         stt=datetime.datetime.now()
         out_fn=run_pgsql2osm(m,bbox,output_prefix)
@@ -143,8 +143,6 @@ def calculate_areas(c:psycopg2.extensions.cursor)->typing.Dict[int,float] :
     areas={}
     for (area,x) in c.fetchall() :
         areas[x]=area
-
-    print('got area split')
     return areas
 
 def statically_get_splits(bbox:bbox_t,target_area=2.0) ->typing.Iterator[bbox_t] :
@@ -198,18 +196,46 @@ def osmium_get_extent(filename:str)->(float,float,float,float) :
     return accum_bbox
 
 def run_java_mapcreator(*args:str,**kwargs)->datetime.timedelta :
+    """ Drive the java OsmAndMapCreator program, with RAM limits set,
+    and in the correct working directory
+    """
     verbose=True
 
     start_t=datetime.datetime.now()
-    env=[]
+    config={'maxram':None,'minram':None,'absdir':None,'workdir':None}
     for k,v in kwargs.items() :
-        env.append(f'{k}={v}')
-    if len(env)!=0 :
-        env.insert(0,'env')
-    cmd=[*env,'bash','/home/user/src/run_mapcreator.sh',*args]
+        if k=='MAX_RAM' :
+            config['maxram']=v
+            if config['minram']==None :
+                #default: deduce automatically
+                config['minram']='1'+v[-1] # v=35G -> 1G, v=125M -> 1M
+        elif k=='MIN_RAM' :
+            config['minram']=v
+        elif k=='ABS_DIR' :
+            config['absdir']=v
+            assert v[0]=='/', "Need to provide absolute path (eg /home/user/OsmAndMapCreator/, not just OsmAndMapCreator/)"
+            if config['absdir'][-1]=='/' :
+                #remove trailing slash
+                config['absdir']=config['absdir'][:-1]
+        elif k=='WORK_DIR' :
+            config['workdir']=v
+            if config['workdir'][-1]=='/' :
+                #remove trailing slash
+                config['workdir']=config['workdir'][:-1]
+
+    #check required keys
+    for k in ('workdir','absdir','maxram') :
+        k_show=k.upper().replace('DIR','_DIR').replace('RAM','_RAM')
+        assert config[k] is not None,f'Error: config value {k_show} not provided'
+    return_dir=os.getcwd()
+    os.chdir(config['workdir'])
+
+    cmd=['env',f'JAVA_OPTS=-Xms{config["minram"]} -Xmx{config["maxram"]}']
+    cmd.extend(['bash',config['absdir']+'/utilities.sh',*args])
     a=subprocess.Popen(cmd,stdout=sys.stdout if verbose else subprocess.PIPE,
             stderr=sys.stderr if verbose else subprocess.PIPE)
-    a.wait(timeout=24*3600) #wait at most 24h, crash else
+    a.wait(timeout=48*3600) #wait 48h, crash if not finished by then
+    os.chdir(return_dir)
     if verbose :
         print('\n'*5)
     if a.returncode!=0 :
@@ -218,51 +244,87 @@ def run_java_mapcreator(*args:str,**kwargs)->datetime.timedelta :
         exit(a.returncode)
     return datetime.datetime.now()-start_t
 
+def check_obf_splits(ls:list[str])->typing.Iterator[list[str]] :
+    """ For a list of input filenames, check their sizes and if they
+    are too big in total (hard limit 2GB for obf format), yield
+    the split up list so that seach split is <2GB.
+    """
+    running_total=0
+    running_list=[]
+    printed_warn=False
+    for i in ls :
+        sz=os.path.getsize(i)
+        running_total+=sz
+        print(running_total,'\t',sz)
+        if running_total>2e9 :
+            if not printed_warn :
+                printed_warn=True
+                msg=f'WARNING:Total size of {round(running_total*1e-9,2)}G'
+                msg+='is too big: obf format only supports max 2GB per file.'
+                msg+='Will create mutiple <2GB obfs'
+                msg+='RECOMMENDED: make multiple smaller obfs of provinces,'
+                msg+='instead of getting north-south stripes like this script will do now...'
+                print(msg)
+            yield running_list #without current i
+        running_list.append(i)
+    yield running_list
 
-def assemble_splits_to_obf(input_splits:typing.Iterator[str],output_prefix:str) :
+def assemble_splits_to_obf(input_splits:typing.Iterator[str],osmand_abs_dir:str,output_prefix:str) :
     input_splits=list(input_splits) #in case of a generator, collapse it (for reading multiple times)
-    max_ram='10G'
     max_ram_int=round(max(map(os.path.getsize,input_splits))*10*1e-9)
     max_ram=str(max(max_ram_int,1))+'G' #?
     print('max_ram',max_ram)
     work_dir='/'.join(output_prefix.split('/')[:-1])
+    osmand_conf={'MAX_RAM':max_ram,'WORK_DIR':work_dir,'ABS_DIR':osmand_abs_dir}
     obf_splits=[]
     for osm_split in input_splits :
         #yes the java does that .split('.')[0].capitalize() internally...
         deduced_out_obf=osm_split.split('/')[-1].split('.')[0]
         deduced_out_obf=work_dir+'/'+deduced_out_obf.capitalize()+'.obf'
-        os.chdir(work_dir)
         print('generating obf',osm_split,'->',deduced_out_obf)
-        print('done in',run_java_mapcreator('generate-obf','--ram-process',osm_split,MAX_RAM=max_ram))
+        t=run_java_mapcreator('generate-obf','--ram-process',osm_split,**osmand_conf)
+        print('done in',t)
         obf_splits.append(deduced_out_obf)
 
-    out_obf=output_prefix+'.obf'
-    os.chdir(work_dir)
-    print('merging obfs',obf_splits,'->',out_obf)
-    print('done in',run_java_mapcreator('merge-index','--address','--poi',out_obf,*obf_splits,MAX_RAM=max_ram))
+    obf_splitss=list(check_obf_splits(obf_splits)) # ss means liSt of liSts
+    if len(obf_splitss)>1 :
+        print('Outputting',len(obf_splitss),'<2GB obfs')
+    for ix,obf_splits in enumerate(obf_splitss) :
+        if len(obf_splitss)==1 :
+            out_obf=output_prefix+'.obf'
+        else :
+            out_obf=output_prefix+f'_{ix+1}.obf'
+        print('merging obfs',obf_splits,'->',out_obf)
+        t=run_java_mapcreator('merge-index','--address','--poi',out_obf,*obf_splits,**osmand_conf)
+        if len(obf_splitss)==1 :
+            print('done in',t)
+        else :
+            print('done',ix+1,'/',len(obf_splitss),'in',t)
 
 
 """
 Usage:
     This script manages different programs together to produce a .obf file at the end.
     Input data is read from the database and converted to .osm.bz2 with pgsql2osm.py
-    in stripes.
+    or osmium, in stripes.
     Those stripes are then individually converted to .obf with the RAM-hungry
-        process: do not paralellize unless you have >64GB RAM to spare
-    And finally, all stripes are merged into one big .obf
+        process: do not paralellize unless you have >20GB RAM to spare
+    And finally, all stripes are merged into one big .obf as long as the size sum
+    is < 2GB (obf does not support bigger files).
 
 """
 
 if __name__=='__main__' :
-    dbaccess,osm_rel_id,output_prefix=sys.argv[1:]
+    dbaccess,osmand_abs_dir,osm_rel_id,output_prefix=sys.argv[1:]
 
-    mode=3 #TEMP, 1:osmium, 2:pgsql2osm, 3:debug, from already existing splits
+    mode=2 #TEMP, 1:osmium, 2:pgsql2osm, 3:debug, from already existing splits
     if mode==1 :
         filename=osm_rel_id
         out_splits_osm=list(multi_osm_to_obf_osmium(
             statically_get_splits(osmium_get_extent(filename)),filename,output_prefix
         ))
     elif mode==2 :
+        assert available_pgsgl2osm,'Required in pgsql2osm mode'
         osm_rel_id=int(osm_rel_id)
         a=psycopg2.connect(dbaccess)
         stripes=get_stripes_by_area(calculate_areas(a.cursor()))
@@ -271,6 +333,6 @@ if __name__=='__main__' :
         import glob
         out_splits_osm=list(sorted(glob.glob(output_prefix+'*.osm.bz2')))
 
-    assemble_splits_to_obf(out_splits_osm,output_prefix)
+    assemble_splits_to_obf(out_splits_osm,osmand_abs_dir,output_prefix)
 
     #[os.remove(i) for i in out_splits_osm]
