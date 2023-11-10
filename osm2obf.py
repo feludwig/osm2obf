@@ -11,7 +11,9 @@ import argparse
 
 
 #relative to self location
-sys.path.extend(['../pgsql2osm','pgsql2osm'])
+for i in ['../pgsql2osm','pgsql2osm'] :
+    sys.path.append(i)
+    sys.path.append(os.path.dirname(__file__)+'/'+i)
 try :
     import pgsql2osm
     available_pgsgl2osm=True
@@ -55,7 +57,9 @@ def get_stripes_by_area(areas)->typing.Iterator[bbox_t] :
         start_bx=curr_bx
         curr_area=0.0
 
-def run_pgsql2osm(m:pgsql2osm.ModuleSettings,bbox:bbox_t,outfile_pfx:str) :
+def run_pgsql2osm(m,bbox:bbox_t,outfile_pfx:str) :
+    """ m:pgsql2osm.ModuleSettings but pgsql2osm may not be defined at this point
+    """
     st_x_s=str(bbox[0]).replace('.','_')
     en_x_s=str(bbox[2]).replace('.','_')
     outfile=f'{outfile_pfx}_{st_x_s}-{en_x_s}'.replace('.','_')
@@ -195,111 +199,142 @@ def osmium_get_extent(filename:str)->(float,float,float,float) :
             accum_bbox[3]=d
     return accum_bbox
 
-def run_java_mapcreator(*args:str,**kwargs)->datetime.timedelta :
-    """ Drive the java OsmAndMapCreator program, with RAM limits set,
-    and in the correct working directory
-    """
-    verbose=True
+class OsmAndRunner :
+    def __init__(self, osmand_abs_dir:str, output_prefix:str, verbose=False) :
+        self.output_prefix=output_prefix
+        work_dir=os.path.dirname(self.output_prefix)
+        self.config={'WORK_DIR':work_dir,'ABS_DIR':osmand_abs_dir}
+        self.verbose=verbose
 
-    start_t=datetime.datetime.now()
-    config={'maxram':None,'minram':None,'absdir':None,'workdir':None}
-    for k,v in kwargs.items() :
-        if k=='MAX_RAM' :
-            config['maxram']=v
-            if config['minram']==None :
-                #default: deduce automatically
-                config['minram']='1'+v[-1] # v=35G -> 1G, v=125M -> 1M
-        elif k=='MIN_RAM' :
-            config['minram']=v
-        elif k=='ABS_DIR' :
-            config['absdir']=v
-            assert v[0]=='/', "Need to provide absolute path (eg /home/user/OsmAndMapCreator/, not just OsmAndMapCreator/)"
-            if config['absdir'][-1]=='/' :
-                #remove trailing slash
-                config['absdir']=config['absdir'][:-1]
-        elif k=='WORK_DIR' :
-            config['workdir']=v
-            if config['workdir'][-1]=='/' :
-                #remove trailing slash
-                config['workdir']=config['workdir'][:-1]
+    def run_java_mapcreator(self,*args:str)->datetime.timedelta :
+        """ Drive the java OsmAndMapCreator program, with RAM limits set,
+        and in the correct working directory
+        """
 
-    #check required keys
-    for k in ('workdir','absdir','maxram') :
-        k_show=k.upper().replace('DIR','_DIR').replace('RAM','_RAM')
-        assert config[k] is not None,f'Error: config value {k_show} not provided'
-    return_dir=os.getcwd()
-    os.chdir(config['workdir'])
+        start_t=datetime.datetime.now()
+        config={'maxram':None,'minram':None,'absdir':None,'workdir':None}
+        for k,v in self.config.items() :
+            if k=='MAX_RAM' :
+                config['maxram']=v
+                if config['minram']==None :
+                    #default: deduce automatically
+                    config['minram']='1'+v[-1] # v=35G -> 1G, v=125M -> 1M
+            elif k=='MIN_RAM' :
+                config['minram']=v
+            elif k=='ABS_DIR' :
+                config['absdir']=v
+                assert v[0]=='/', "Need to provide absolute path (eg /home/user/OsmAndMapCreator/, not just OsmAndMapCreator/)"
+                if len(config['absdir'])>0 and config['absdir'][-1]=='/' :
+                    #remove trailing slash
+                    config['absdir']=config['absdir'][:-1]
+            elif k=='WORK_DIR' :
+                config['workdir']=v
+                if len(config['workdir'])>0 and config['workdir'][-1]=='/' :
+                    #remove trailing slash
+                    config['workdir']=config['workdir'][:-1]
 
-    cmd=['env',f'JAVA_OPTS=-Xms{config["minram"]} -Xmx{config["maxram"]}']
-    cmd.extend(['bash',config['absdir']+'/utilities.sh',*args])
-    a=subprocess.Popen(cmd,stdout=sys.stdout if verbose else subprocess.PIPE,
-            stderr=sys.stderr if verbose else subprocess.PIPE)
-    a.wait(timeout=48*3600) #wait 48h, crash if not finished by then
-    os.chdir(return_dir)
-    if verbose :
-        print('\n'*5)
-    if a.returncode!=0 :
-        print(a.stdout.read().decode())
-        print(a.stderr.read().decode())
-        exit(a.returncode)
-    return datetime.datetime.now()-start_t
+        #check required keys
+        for k in ('workdir','absdir','maxram') :
+            k_show=k.upper().replace('DIR','_DIR').replace('RAM','_RAM')
+            assert config[k] is not None,f'Error: config value {k_show} not provided'
+        return_dir=os.getcwd()
+        os.chdir(config['workdir'] if len(config['workdir'])>0 else '.')
 
-def check_obf_splits(ls:list[str])->typing.Iterator[list[str]] :
-    """ For a list of input filenames, check their sizes and if they
-    are too big in total (hard limit 2GB for obf format), yield
-    the split up list so that seach split is <2GB.
-    """
-    running_total=0
-    running_list=[]
-    printed_warn=False
-    for i in ls :
-        sz=os.path.getsize(i)
-        running_total+=sz
-        print(running_total,'\t',sz)
-        if running_total>2e9 :
-            if not printed_warn :
-                printed_warn=True
-                msg=f'WARNING:Total size of {round(running_total*1e-9,2)}G'
-                msg+='is too big: obf format only supports max 2GB per file.'
-                msg+='Will create mutiple <2GB obfs'
-                msg+='RECOMMENDED: make multiple smaller obfs of provinces,'
-                msg+='instead of getting north-south stripes like this script will do now...'
-                print(msg)
-            yield running_list #without current i
-        running_list.append(i)
-    yield running_list
+        cmd=['env',f'JAVA_OPTS=-Xms{config["minram"]} -Xmx{config["maxram"]}']
+        cmd.extend(['bash',config['absdir']+'/utilities.sh',*args])
+        #closed stdin is required
+        a=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        stdout,stderr=a.communicate(None,timeout=48*3600) #wait 48h, crash if not finished by then
+        os.chdir(return_dir)
+        if self.verbose :
+            print('\n'*5)
+        if a.returncode!=0 :
+            print(stdout.decode())
+            print(stderr.decode())
+            if stdout.decode().find('java.lang.OutOfMemoryError')>=0 :
+                print('java ran out of memory')
+                print('TODO: retry without --ram-process? then retry with higher MAX_RAM')
+            exit(a.returncode)
+        return datetime.datetime.now()-start_t
 
-def assemble_splits_to_obf(input_splits:typing.Iterator[str],osmand_abs_dir:str,output_prefix:str) :
-    input_splits=list(input_splits) #in case of a generator, collapse it (for reading multiple times)
-    max_ram_int=round(max(map(os.path.getsize,input_splits))*10*1e-9)
-    max_ram=str(max(max_ram_int,1))+'G' #?
-    print('max_ram',max_ram)
-    work_dir='/'.join(output_prefix.split('/')[:-1])
-    osmand_conf={'MAX_RAM':max_ram,'WORK_DIR':work_dir,'ABS_DIR':osmand_abs_dir}
-    obf_splits=[]
-    for osm_split in input_splits :
-        #yes the java does that .split('.')[0].capitalize() internally...
-        deduced_out_obf=osm_split.split('/')[-1].split('.')[0]
-        deduced_out_obf=work_dir+'/'+deduced_out_obf.capitalize()+'.obf'
-        print('generating obf',osm_split,'->',deduced_out_obf)
-        t=run_java_mapcreator('generate-obf','--ram-process',osm_split,**osmand_conf)
-        print('done in',t)
-        obf_splits.append(deduced_out_obf)
+    def check_obf_splits(self,ls:list[str])->typing.Iterator[list[str]] :
+        """ For a list of input filenames, check their sizes and if they
+        are too big in total (hard limit 2GB for obf format), yield
+        the split up list so that seach split is <2GB.
+        """
 
-    obf_splitss=list(check_obf_splits(obf_splits)) # ss means liSt of liSts
-    if len(obf_splitss)>1 :
-        print('Outputting',len(obf_splitss),'<2GB obfs')
-    for ix,obf_splits in enumerate(obf_splitss) :
-        if len(obf_splitss)==1 :
-            out_obf=output_prefix+'.obf'
+        running_total=0
+        running_list=[]
+        printed_warn=False
+        for i in ls :
+            sz=os.path.getsize(i)
+            running_total+=sz
+            print(running_total,'\t',sz)
+            if running_total>2.1e9 :
+                if not printed_warn :
+                    printed_warn=True
+                    msg=f'WARNING:Total size of {round(running_total*1e-9,2)}G '
+                    msg+='is too big: obf format only supports max 2GB per file. '
+                    msg+='Will create mutiple <2GB obfs\n'
+                    msg+='RECOMMENDED: make multiple smaller obfs of provinces, '
+                    msg+='instead of getting north-south stripes like this script will do now...'
+                    print(msg)
+                yield running_list #without current i
+                running_list=[]
+            running_list.append(i)
+        yield running_list
+
+    def set_max_ram(self,input_splits:typing.List[str],sum_mode=False) :
+        if sum_mode :
+            max_ram_int=round(sum(map(os.path.getsize,input_splits))*4*1e-9)
         else :
-            out_obf=output_prefix+f'_{ix+1}.obf'
-        print('merging obfs',obf_splits,'->',out_obf)
-        t=run_java_mapcreator('merge-index','--address','--poi',out_obf,*obf_splits,**osmand_conf)
-        if len(obf_splitss)==1 :
+            max_ram_int=round(max(map(os.path.getsize,input_splits))*23*1e-9)
+
+        max_ram=str(max(max_ram_int,1))+'G' #?
+        print('max_ram',max_ram)
+        self.config['MAX_RAM']=max_ram
+
+    def convert_splits_to_obf(self,input_splits:typing.Iterator[str],
+            skip_existing=False)->typing.Iterator[typing.List[str]] :
+        """ Returns obf_splitss as a list of lists of obf filenames.
+        This is to ensure the obf fileformat limit of 2GB is not reached (obf unsupported).
+        Input: a list of .osm.bz2 or similar formats (osm,osm.pbf,osm.gz) filenames, each
+        will be individually converted to obf.
+        """
+        input_splits=list(input_splits) #in case of a generator, collapse it (for reading multiple times)
+        self.set_max_ram(input_splits)
+        obf_splits=[]
+        for osm_split in input_splits :
+            #yes the java does that .split('.')[0].capitalize() internally...
+            deduced_out_obf=osm_split.split('/')[-1].split('.')[0]
+            deduced_out_obf=self.config['WORK_DIR']+'/'+deduced_out_obf.capitalize()+'.obf'
+            if skip_existing and os.path.exists(deduced_out_obf) :
+                continue
+            print('generating obf',osm_split,'->',deduced_out_obf)
+            t=self.run_java_mapcreator('generate-obf','--ram-process',osm_split)
             print('done in',t)
-        else :
-            print('done',ix+1,'/',len(obf_splitss),'in',t)
+            obf_splits.append(deduced_out_obf)
+
+        yield from self.check_obf_splits(obf_splits)
+
+    def assemble_splits_to_obf(self,obf_splitss:typing.Iterator[typing.List[str]]) :
+
+        obf_splitss=list(obf_splitss) # ss means liSt of liSts, collapse generator
+        if len(obf_splitss)>1 :
+            print('Outputting',len(obf_splitss),'<2GB obfs')
+        for ix,obf_splits in enumerate(obf_splitss) :
+            if len(obf_splitss)==1 :
+                out_obf=output_prefix+'.obf'
+            else :
+                out_obf=output_prefix+f'_{ix+1}.obf'
+            print('merging obfs',obf_splits,'->',out_obf)
+            self.set_max_ram(obf_splits,sum_mode=True)
+            t=self.run_java_mapcreator('merge-index','--address','--poi',out_obf,*obf_splits)
+            if len(obf_splitss)==1 :
+                print('done in',t)
+            else :
+                print('done',ix+1,'/',len(obf_splitss),'in',t)
 
 
 """
@@ -316,8 +351,9 @@ Usage:
 
 if __name__=='__main__' :
     dbaccess,osmand_abs_dir,osm_rel_id,output_prefix=sys.argv[1:]
+    ocr=OsmAndRunner(osmand_abs_dir,output_prefix)
 
-    mode=2 #TEMP, 1:osmium, 2:pgsql2osm, 3:debug, from already existing splits
+    mode=3 #TEMP, 1:osmium, 2:pgsql2osm, 3:resume, from already existing splits
     if mode==1 :
         filename=osm_rel_id
         out_splits_osm=list(multi_osm_to_obf_osmium(
@@ -331,8 +367,11 @@ if __name__=='__main__' :
         out_splits_osm=list(multi_osm_to_obf_pgsql2osm(a,stripes,output_prefix,osm_rel_id))
     elif mode==3 :
         import glob
-        out_splits_osm=list(sorted(glob.glob(output_prefix+'*.osm.bz2')))
+        #obf_splitss=list(ocr.check_obf_splits(sorted(glob.glob(output_prefix+'_*.obf'))))
+        out_splits_osm=list(sorted(glob.glob(output_prefix+'_*.osm.bz2')))
 
-    assemble_splits_to_obf(out_splits_osm,osmand_abs_dir,output_prefix)
+    obf_splitss=ocr.convert_splits_to_obf(out_splits_osm,skip_existing=True)
+    ocr.assemble_splits_to_obf(obf_splitss)
 
-    #[os.remove(i) for i in out_splits_osm]
+    [os.remove(i) for i in out_splits_osm]
+    [os.remove(i) for s in obf_splitss for i in s]
