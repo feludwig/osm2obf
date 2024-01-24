@@ -1,11 +1,10 @@
 # osm2obf
 
-Produce `.obf` from `.osm` or PostgreSQL+PostGIS database, possibly province or country-sized.
+Produce `.obf` from `.osm` or PostgreSQL+PostGIS database, possibly province or
+small country-sized.
 
-**Experimental**
 
-
-Uses
+Using
 [OsmAndMapCreator](https://wiki.openstreetmap.org/wiki/OsmAndMapCreator) for all `obf` processing.
 
 
@@ -14,46 +13,57 @@ systems and that's why processing is usually done one-by-one to not put too much
 (instead of opting for performance by running everything in parallel).
 
 
-For big geographical extracts, the `obf` file format has a 2GB hard max filesize limit.
+For big geographical extracts, the `.obf` file format does not allow files bigger than 2GB.
 To extract a country, this script will output multiple < 2GB `obf`s as north-south stripes.
 If you want more meaningful sub-extracts, please run multiple times with corresponding provinces.
 * **Planned** handle the "multiple runs" part automagically.
 * **Planned** maybe take in a list of geojson files, for making the splits along them...
 
 
+# Usage
+
+After cloning this repository,
+```
+git clone https://github.com/feludwig/osm2obf
+cd osm2obf/
+```
+Download OsmAndMapCreator
+```
+wget 'https://download.osmand.net/latest-night-build/OsmAndMapCreator-main.zip'
+mkdir osmandmapcreator/
+unzip OsmAndMapCreator-main.zip -d osmandmapcreator/
+```
+Then run
+* `postgres` (database) mode
+```
+python3 osm2obf.py postgres --dsn 'dbname=gis' -r {osm_rel_id} --output {output_file.obf}
+```
+* `osmium` (file) mode
+```
+python3 osm2obf.py osmium --dsn 'dbname=gis' --input {input.osm} --output {output_file.obf}
+```
+Where `{output_file.obf}`'s directory will be used as the temporary working directory, and the output
+`obf` will just be `{output_file.obf}` IF it is smaller than 2GB (else there will be multiple `obf`s).
+
+
 # Requirements
 
-## Mode: `osm` input file
+For all modes
+* `java` for `OsmAndMapCreator`, instructions to [download](#usage).
+
+## Mode: osmium
 
 
-reading in an `osm` file directly, with
+reading in a `.osm` file directly, with
 [osmium](https://osmcode.org/osmium-tool/)
-and all of its supported input formats: `osm`,`osm.pbf`,`osm.bz2`,...
+and all of its supported input formats: `.osm`,`.osm.pbf`,`.osm.bz2`,...
 
 * `osmium`
 
+
 ## Mode: PostgreSQL+PostGIS OpenStreetMap database
+
 
 * [pgsql2osm](https://github.com/feludwig/pgsql2osm)
 * database `SELECT` permissions
-
-
-# Usage
-
-First, download OsmAndMapCreator
-```
-wget 'https://download.osmand.net/latest-night-build/OsmAndMapCreator-main.zip'
-mkdir osmanmapcreator/
-unzip OsmAndMapCreator-main.zip -d osmanmapcreator/
-```
-Then run (database mode)
-```
-python3 -u osm2obf.py 'dbname=gis' /absolute/path/to/osm2obf/osmanmapcreator {osm_rel_id} {output_obf_prefix}
-```
-Then run (file mode)
-```
-python3 -u osm2obf.py 'dbname=gis' /absolute/path/to/osm2obf/osmanmapcreator {input.osm} {output_obf_prefix}
-```
-Where `{output_obf_prefix}`'s directory will be used as the temporary working directory, and the output
-`obf` will just be `{output_obf_prefix}.obf` IF it is smaller than 2GB (else there will be multiple `obf`s).
 

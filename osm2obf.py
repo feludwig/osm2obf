@@ -9,6 +9,12 @@ import datetime
 import typing
 import argparse
 
+"""
+TODO
+    max_ram presets lower again, and DO NOT REMOVE netherlands obfs, re-merge...
+    merge approach: try if <2.5GB and else split up...
+    max_ram approach: retry without --ram-process and only then give up
+"""
 
 #relative to self location
 for i in ['../pgsql2osm','pgsql2osm'] :
@@ -63,7 +69,7 @@ def run_pgsql2osm(m,bbox:bbox_t,outfile_pfx:str) :
     st_x_s=str(bbox[0]).replace('.','_')
     en_x_s=str(bbox[2]).replace('.','_')
     outfile=f'{outfile_pfx}_{st_x_s}-{en_x_s}'.replace('.','_')
-    outfile+='.osm.bz2'
+    outfile+='_split.osm.bz2'
     bbox_as_str=','.join(map(str,bbox))
     print('pgsql2osm','--bbox='+bbox_as_str,'| bzip2 >',outfile,'...')
 
@@ -89,7 +95,7 @@ def multi_osm_to_obf_osmium(bboxes:typing.Iterator[bbox_t],input_file:str,output
         else :
             encountered_out_descrs[out_descr]+=1
         int_charcode=b'a'[0]+encountered_out_descrs[out_descr] # 'a'+2=='c'
-        out_filename=output_prefix+'_'+bytes((int_charcode,)).decode()+'_'+out_descr+'.osm.bz2'
+        out_filename=output_prefix+'_'+bytes((int_charcode,)).decode()+'_'+out_descr+'_split.osm.bz2'
 
         bbox_as_str=','.join(map(str,bbox))
         stt=datetime.datetime.now()
@@ -101,15 +107,16 @@ def multi_osm_to_obf_osmium(bboxes:typing.Iterator[bbox_t],input_file:str,output
         yield out_filename
 
 def multi_osm_to_obf_pgsql2osm(access:psycopg2.extensions.connection,stripes:typing.Iterator[bbox_t],
-        output_prefix:str,osm_rel_id:int)->typing.Iterator[str] :
+        output_prefix:str,args:argparse.Namespace)->typing.Iterator[str] :
 
     stripes=list(stripes) #collapse generator
     print('getting',len(stripes),'stripes')
 
     m=pgsql2osm.ModuleSettings(
-        bounds_rel_id=osm_rel_id,
-        get_lonlat_binary='/home/user/src/osm2pgsql/build/get_lonlat',
-        nodes_file='/mnt/dbp/maps/planet.bin.nodes',
+        #copy these keys, required for pgsql2osm
+        **{k:getattr(args,k) for k in ('bounds_rel_id','bounds_iso','bounds_geojson',
+            'get_lonlat_binary','nodes_file')},
+        has_suggested_out_filename=True, #do not print suggestion filename
         access=access)
     for bbox in stripes :
         stt=datetime.datetime.now()
@@ -118,8 +125,25 @@ def multi_osm_to_obf_pgsql2osm(access:psycopg2.extensions.connection,stripes:typ
         print('extracted',out_fn,'in',dt)
         yield out_fn #after printing
 
-def calculate_areas(c:psycopg2.extensions.cursor)->typing.Dict[int,float] :
+def calculate_areas(c:psycopg2.extensions.cursor,args:argparse.Namespace)->typing.Dict[int,float] :
     print('calculating area split...')
+    from_rel_id=False
+    if args.bounds_geojson!=None :
+        with open(args.bounds_geojson,'r') as f :
+            geojson=f.read().strip()
+        way=f"(ST_Transform(ST_GeomFromGeoJSON('{geojson}'::jsonb),3857))"
+    elif args.bounds_rel_id!=None :
+        osm_rel_id=args.bounds_rel_id
+        from_rel_id=True
+    elif args.bounds_iso!=None :
+        c_name,osm_rel_id=pgsql2osm.regions_lookup(args.bounds_iso)
+        osm_rel_id=int(osm_rel_id)
+        from_rel_id=True
+
+    if from_rel_id :
+        #relation ids are stored negative
+        way=f'(SELECT ST_Transform(relbound.way,3857) FROM planet_osm_polygon AS relbound WHERE osm_id={-osm_rel_id})'
+
     # ST_Intersects is much better, bbox && gets tripped up by -90 to +90 N/S extent
     # and says true much too often
     #print(c.mogrify(f"""WITH a AS (
@@ -136,14 +160,14 @@ def calculate_areas(c:psycopg2.extensions.cursor)->typing.Dict[int,float] :
     # take square-degrees areas
     q=f"""SELECT
             ST_Area(ST_Transform(
-                    ST_Intersection((SELECT way FROM planet_osm_polygon WHERE osm_id=-%s),
-                a_3857),4326)),(x*100)::int AS x
+                    ST_Intersection({way},a_3857),4326)),
+            (x*100)::int AS x
         FROM (SELECT ST_Transform(
                 ST_MakeEnvelope(x,-89.999,x+{split_size},89.999,4326),3857) AS a_3857,x
             FROM generate_series(-180.0,180.0,{split_size}) AS x
         ) AS foo
-        WHERE ST_Intersects(a_3857,(SELECT way FROM planet_osm_polygon WHERE osm_id=-%s));"""
-    c.execute(c.mogrify(q,(osm_rel_id,osm_rel_id,)))
+        WHERE ST_Intersects(a_3857,{way});"""
+    c.execute(q)
     areas={}
     for (area,x) in c.fetchall() :
         areas[x]=area
@@ -270,11 +294,11 @@ class OsmAndRunner :
         for i in ls :
             sz=os.path.getsize(i)
             running_total+=sz
-            print(running_total,'\t',sz)
+            #print(running_total,'\t',sz,i)
             if running_total>2.1e9 :
                 if not printed_warn :
                     printed_warn=True
-                    msg=f'WARNING:Total size of {round(running_total*1e-9,2)}G '
+                    msg=f'WARNING: Total size of {round(running_total*1e-9,2)}G '
                     msg+='is too big: obf format only supports max 2GB per file. '
                     msg+='Will create mutiple <2GB obfs\n'
                     msg+='RECOMMENDED: make multiple smaller obfs of provinces, '
@@ -311,34 +335,38 @@ class OsmAndRunner :
             deduced_out_obf=self.config['WORK_DIR']+'/'+deduced_out_obf.capitalize()+'.obf'
             if skip_existing and os.path.exists(deduced_out_obf) :
                 continue
-            print('generating obf',osm_split,'->',deduced_out_obf)
+            print('generating',self.bn(osm_split),'->',self.bn(deduced_out_obf),'...')
             t=self.run_java_mapcreator('generate-obf','--ram-process',osm_split)
-            print('done in',t)
+            print('generated in',t)
             obf_splits.append(deduced_out_obf)
-
         yield from self.check_obf_splits(obf_splits)
 
-    def assemble_splits_to_obf(self,obf_splitss:typing.Iterator[typing.List[str]]) :
+    def bn(self,inp) :
+        """Basename alias, also accepts iterables"""
+        if isinstance(inp,typing.Iterable) and not isinstance(inp,str):
+            return repr([self.bn(i) for i in inp])
+        return os.path.basename(inp)
 
-        obf_splitss=list(obf_splitss) # ss means liSt of liSts, collapse generator
+    def assemble_splits_to_obf(self,obf_splitss:typing.Iterator[typing.List[str]]) :
         if len(obf_splitss)>1 :
             print('Outputting',len(obf_splitss),'<2GB obfs')
         for ix,obf_splits in enumerate(obf_splitss) :
             if len(obf_splitss)==1 :
-                out_obf=output_prefix+'.obf'
+                out_obf=self.output_prefix+'.obf'
             else :
-                out_obf=output_prefix+f'_{ix+1}.obf'
-            print('merging obfs',obf_splits,'->',out_obf)
+                out_obf=self.output_prefix+f'_{ix+1}.obf'
+            print('merging',self.bn(obf_splits),'->',self.bn(out_obf),'...')
             self.set_max_ram(obf_splits,sum_mode=True)
             t=self.run_java_mapcreator('merge-index','--address','--poi',out_obf,*obf_splits)
             if len(obf_splitss)==1 :
-                print('done in',t)
+                print('merged in',t,';\t',self.bn(out_obf),os.path.getsize(out_obf),'bytes')
             else :
-                print('done',ix+1,'/',len(obf_splitss),'in',t)
+                print('merged',ix+1,'/',len(obf_splitss),'in',t,';\t',
+                        self.bn(out_obf),os.path.getsize(out_obf),'bytes')
 
 
 """
-Usage:
+Mechanism:
     This script manages different programs together to produce a .obf file at the end.
     Input data is read from the database and converted to .osm.bz2 with pgsql2osm.py
     or osmium, in stripes.
@@ -346,32 +374,92 @@ Usage:
         process: do not paralellize unless you have >20GB RAM to spare
     And finally, all stripes are merged into one big .obf as long as the size sum
     is < 2GB (obf does not support bigger files).
-
 """
 
 if __name__=='__main__' :
-    dbaccess,osmand_abs_dir,osm_rel_id,output_prefix=sys.argv[1:]
-    ocr=OsmAndRunner(osmand_abs_dir,output_prefix)
+    parser=argparse.ArgumentParser(prog='osm2obf')
+    subparsers = parser.add_subparsers(title='input modes',required=True,
+        help="See '%(prog)s {mode} --help' for a mode's detailed options")
 
-    mode=3 #TEMP, 1:osmium, 2:pgsql2osm, 3:resume, from already existing splits
-    if mode==1 :
-        filename=osm_rel_id
-        out_splits_osm=list(multi_osm_to_obf_osmium(
-            statically_get_splits(osmium_get_extent(filename)),filename,output_prefix
-        ))
-    elif mode==2 :
+    s=subparsers.add_parser('postgres', help='''Read osm data from a osm2pgsql
+        imported databe (MUST be with --slim), WARNING: --bbox unsupported for region choice''')
+    s.set_defaults(mode='postgres')
+    s.add_argument('get_lonlat_binary',
+        help="Path to the get_lonlat binary")
+    s.add_argument('nodes_file',
+        help='Path to the nodes file created by osm2pgsql at import')
+    s.add_argument('-d','--dsn',dest='postgres_dsn',
+        default='dbname=gis port=5432',
+        help="The connection string to pass to psycopg2, default '%(default)s'")
+    bounds_g=s.add_mutually_exclusive_group(required=True)
+    bounds_g.add_argument('-r','--osm-rel-id',dest='bounds_rel_id',
+        default=None,type=int,
+        help='Integer for the osm relation that should make the boundary')
+    bounds_g.add_argument('-i','--iso',dest='bounds_iso',
+        default=None,
+        help='Country or region code for looking up in pgsql2osm/regions.csv, to determine boundary')
+    bounds_g.add_argument('-g','--geojson',dest='bounds_geojson',
+        default=None,
+        help='Geojson file for determining the boundary')
+
+
+    s=subparsers.add_parser('osmium', help='''Read osm data from a .osm
+        (or any supported .osm.pbf, .osm.bz2 ...) with osmium (depends on osmium)''')
+    s.set_defaults(mode='osmium')
+    s.add_argument('-i','--input',dest='in_file',type=str,required=True,
+        help="""Input filename, can be any format supported by osmium; for example .osm,
+        .osm.pbf, .osm.bz2""")
+
+
+    s=subparsers.add_parser('resume', help='''Resume a started extract, regardless of 'postgres' or
+    'osmium' mode. All *_split.osm.bz2 files should be already created, this part will then put them
+    together into .obf.''')
+    s.set_defaults(mode='resume')
+
+
+    parser.add_argument('-o','--output',dest='out_file',
+        help="""Path where the output .obf should be written to. Writing to stdout is not supported.
+        NOTE: the directory will be used a temporary working directory (to make all the *_split.osm.bz2 files, will need
+        up to about 2x to 3x free space of original .osm.bz2 or .osm.pbf)""",
+        required=True)
+    parser.add_argument('--osmand',dest='osmand',default=os.path.dirname(__file__)+'/osmandmapcreator',
+        help="""Directory where OsmAndMapCreator is zip-decompressed into. Default will try '%(default)s'.
+        See README.md for how to download and decompress""")
+
+
+    args=parser.parse_args()
+
+    args.out_prefix=os.path.abspath(args.out_file.replace('.obf',''))
+    #make ABSdir
+    args.osmand_abs_dir=os.path.abspath(os.path.realpath(args.osmand))
+
+    #dbaccess,osmand_abs_dir,osm_rel_id,output_prefix=sys.argv[1:]
+    ocr=OsmAndRunner(args.osmand_abs_dir,args.out_prefix)
+
+    if args.mode=='postgres' :
+        #pgsql2osm
         assert available_pgsgl2osm,'Required in pgsql2osm mode'
-        osm_rel_id=int(osm_rel_id)
-        a=psycopg2.connect(dbaccess)
-        stripes=get_stripes_by_area(calculate_areas(a.cursor()))
-        out_splits_osm=list(multi_osm_to_obf_pgsql2osm(a,stripes,output_prefix,osm_rel_id))
-    elif mode==3 :
+        a=psycopg2.connect(args.postgres_dsn)
+        stripes=get_stripes_by_area(calculate_areas(a.cursor(),args))
+        out_splits_osm=list(multi_osm_to_obf_pgsql2osm(a,stripes,args.out_prefix,args))
+    elif args.mode=='osmium' :
+        #osmium
+        out_splits_osm=list(multi_osm_to_obf_osmium(
+            statically_get_splits(osmium_get_extent(filename)),args.in_file,args.out_prefix
+        ))
+    elif args.mode=='resume' :
+        #resume from existing splits files
         import glob
+        out_splits_osm=list(sorted(glob.glob(args.out_prefix+'_*_split.osm.bz2')))
         #obf_splitss=list(ocr.check_obf_splits(sorted(glob.glob(output_prefix+'_*.obf'))))
-        out_splits_osm=list(sorted(glob.glob(output_prefix+'_*.osm.bz2')))
 
-    obf_splitss=ocr.convert_splits_to_obf(out_splits_osm,skip_existing=True)
+    #need to collapse to list here, so that cleanup works properly
+    obf_splitss=list(ocr.convert_splits_to_obf(out_splits_osm,skip_existing=args.mode=='resume'))
     ocr.assemble_splits_to_obf(obf_splitss)
 
+    #cleanup
     [os.remove(i) for i in out_splits_osm]
     [os.remove(i) for s in obf_splitss for i in s]
+    regions_ocbf=os.path.dirname(args.out_prefix)+'/regions.ocbf'
+    if os.path.exists(regions_ocbf) :
+        os.remove(regions_ocbf)
