@@ -64,6 +64,7 @@ and all of its supported input formats: `.osm`,`.osm.pbf`,`.osm.bz2`,...
 ## Mode: PostgreSQL+PostGIS OpenStreetMap database
 
 
-* [pgsql2osm](https://github.com/feludwig/pgsql2osm)
+* `pip install [pgsql2osm](https://github.com/feludwig/pgsql2osm)`
+    - also requires `osm2pgsql` and planet nodesfile
 * database `SELECT` permissions
 

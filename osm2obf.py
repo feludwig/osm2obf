@@ -11,8 +11,6 @@ import argparse
 
 """
 TODO
-    max_ram presets lower again, and DO NOT REMOVE netherlands obfs, re-merge...
-    merge approach: try if <2.5GB and else split up...
     max_ram approach: retry without --ram-process and only then give up
 """
 
@@ -22,8 +20,8 @@ for i in ['../pgsql2osm','pgsql2osm'] :
     sys.path.append(os.path.dirname(__file__)+'/'+i)
 try :
     import pgsql2osm
+    import psycopg2
     available_pgsgl2osm=True
-    psycopg2=pgsql2osm.psycopg2
 except (ModuleNotFoundError,ImportError) :
     available_pgsgl2osm=False
 
@@ -71,7 +69,8 @@ def run_pgsql2osm(m,bbox:bbox_t,outfile_pfx:str) :
     outfile=f'{outfile_pfx}_{st_x_s}-{en_x_s}'.replace('.','_')
     outfile+='_split.osm.bz2'
     bbox_as_str=','.join(map(str,bbox))
-    print('pgsql2osm','--bbox='+bbox_as_str,'| bzip2 >',outfile,'...')
+    print('pgsql2osm','--bbox='+bbox_as_str,'| bzip2 >',os.path.basename(outfile),'...')
+    sys.stdout.flush()
 
     stt=datetime.datetime.now()
     with bz2.open(outfile,'wb') as f:
@@ -81,6 +80,7 @@ def run_pgsql2osm(m,bbox:bbox_t,outfile_pfx:str) :
 
     dt=datetime.datetime.now()-stt
     print(round(os.path.getsize(outfile)/1e6,1),'MB for this bzip2 split in',dt)
+    sys.stdout.flush()
     return outfile
 
 def multi_osm_to_obf_osmium(bboxes:typing.Iterator[bbox_t],input_file:str,output_prefix:str)->typing.Iterator[str] :
@@ -112,7 +112,7 @@ def multi_osm_to_obf_pgsql2osm(access:psycopg2.extensions.connection,stripes:typ
     stripes=list(stripes) #collapse generator
     print('getting',len(stripes),'stripes')
 
-    m=pgsql2osm.ModuleSettings(
+    m=pgsql2osm.settings.ModuleSettings(
         #copy these keys, required for pgsql2osm
         **{k:getattr(args,k) for k in ('bounds_rel_id','bounds_iso','bounds_geojson',
             'get_lonlat_binary','nodes_file')},
@@ -127,6 +127,7 @@ def multi_osm_to_obf_pgsql2osm(access:psycopg2.extensions.connection,stripes:typ
 
 def calculate_areas(c:psycopg2.extensions.cursor,args:argparse.Namespace)->typing.Dict[int,float] :
     print('calculating area split...')
+    sys.stdout.flush()
     from_rel_id=False
     if args.bounds_geojson!=None :
         with open(args.bounds_geojson,'r') as f :
@@ -136,7 +137,7 @@ def calculate_areas(c:psycopg2.extensions.cursor,args:argparse.Namespace)->typin
         osm_rel_id=args.bounds_rel_id
         from_rel_id=True
     elif args.bounds_iso!=None :
-        c_name,osm_rel_id=pgsql2osm.regions_lookup(args.bounds_iso)
+        c_name,osm_rel_id=pgsql2osm.dbutils.regions_lookup(args.bounds_iso)
         osm_rel_id=int(osm_rel_id)
         from_rel_id=True
 
@@ -235,6 +236,7 @@ class OsmAndRunner :
         and in the correct working directory
         """
 
+        sys.stdout.flush()
         start_t=datetime.datetime.now()
         config={'maxram':None,'minram':None,'absdir':None,'workdir':None}
         for k,v in self.config.items() :
@@ -425,6 +427,8 @@ if __name__=='__main__' :
     parser.add_argument('--osmand',dest='osmand',default=os.path.dirname(__file__)+'/osmandmapcreator',
         help="""Directory where OsmAndMapCreator is zip-decompressed into. Default will try '%(default)s'.
         See README.md for how to download and decompress""")
+    parser.add_argument('-k','--keep',dest='keep',action='store_true',default=False,
+        help='Keep all intermediary *_split.osm.bz2 and *_split.obf files')
 
 
     args=parser.parse_args()
@@ -458,8 +462,9 @@ if __name__=='__main__' :
     ocr.assemble_splits_to_obf(obf_splitss)
 
     #cleanup
-    [os.remove(i) for i in out_splits_osm]
-    [os.remove(i) for s in obf_splitss for i in s]
+    if not args.keep :
+        [os.remove(i) for i in out_splits_osm]
+        [os.remove(i) for s in obf_splitss for i in s]
     regions_ocbf=os.path.dirname(args.out_prefix)+'/regions.ocbf'
     if os.path.exists(regions_ocbf) :
         os.remove(regions_ocbf)
